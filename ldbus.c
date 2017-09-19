@@ -11,6 +11,8 @@ struct ldbus
 static DBusError error;
 static struct ldbus db;
 
+static void dispatch_all(void);
+
 static void fd_event(int fd, short event_type, void *data) {
     int flags = 0;
     DBusWatch* watch = data;
@@ -31,7 +33,7 @@ static dbus_bool_t add_watch(DBusWatch *watch, void *data) {
     enabled = dbus_watch_get_enabled(watch);
     DEBUG("New watch : %d %d %d\n", fd, flags, enabled);
 
-    if(!enabled) return TRUE;
+    if(!enabled) return 1;
 
     if(flags & DBUS_WATCH_READABLE)
         event_type |= EVENT_TYPE_READ;
@@ -86,12 +88,13 @@ static void rm_timeout(DBusTimeout *timeout, void *data) {
 
 static void dispatch_all(void) {
     dbus_connection_ref(db.con);
-    while (dbus_connection_get_dispatch_status(db.con) == DBUS_DISPATCH_DATA_REMAINS)
+    while (dbus_connection_get_dispatch_status(db.con) == DBUS_DISPATCH_DATA_REMAINS) {
         dbus_connection_dispatch(db.con);
+    }
     dbus_connection_unref(db.con);
 }
 
-static void wakeup_handler(int signum) {
+static void wakeup_handler(int signum, void* data) {
     if(signum != SIGPOLL)
         return;
 
@@ -99,34 +102,38 @@ static void wakeup_handler(int signum) {
         return;
 
     DEBUG("Dispatch message queue\n");
-    dispatch_all();
+
+    dbus_connection_ref(db.con);
+    dbus_connection_dispatch(db.con);
+    dbus_connection_unref(db.con);
 }
 
 static void wakeup_main(void* data) {
-    signal(SIGPOLL, wakeup_handler);
-
     raise(SIGPOLL);
 }
 
 static void dispatch(DBusConnection *connection, DBusDispatchStatus new_status, void *data) {
-    DEBUG("New status %d\n", new_status);
+    if(new_status == DBUS_DISPATCH_DATA_REMAINS) DEBUG("New data to process\n");
+    else if(new_status == DBUS_DISPATCH_COMPLETE) DEBUG("Data processes\n");
 }
 
-bool ldbus_init(const char* sender) {
+int ldbus_init(const char* sender) {
     char matchfmt[64];
     DBusMessage* msg;
     DBusPendingCall* pc;
     dbus_error_init(&error);
     db.con = dbus_bus_get(DBUS_BUS_SYSTEM, &error);
-    if(dbus_error_is_set(&error)) return FALSE;
+    if(dbus_error_is_set(&error)) return 0;
 
     if(sender) {
         sprintf(matchfmt, "sender='%s'", sender);
         dbus_bus_add_match(db.con, matchfmt, &error);
-        if(dbus_error_is_set(&error)) return FALSE;
+        if(dbus_error_is_set(&error)) return 0;
     }
 
     DEBUG("Unique name : %s\n", dbus_bus_get_unique_name(db.con));
+
+    mainloop_reg_signal(SIGPOLL, wakeup_handler, NULL);
 
     dbus_connection_set_watch_functions(db.con, add_watch, rm_watch, toggle_watch, NULL, NULL);
 
@@ -135,6 +142,10 @@ bool ldbus_init(const char* sender) {
     dbus_connection_set_dispatch_status_function(db.con, dispatch, NULL, NULL);
 
     dbus_connection_set_timeout_functions(db.con, add_timeout, toggle_timeout, rm_timeout, NULL, NULL);
+
+    dispatch_all();
+
+    return 1;
 }
 
 void ldbus_print_error(void) {
@@ -155,5 +166,6 @@ void ldbus_send_async(DBusConnection* con,
     dbus_connection_send_with_reply(db.con, msg, &pc, timeout);
 
     dbus_message_unref(msg);
+
     dbus_pending_call_set_notify(pc, handler, data, NULL);
 }
